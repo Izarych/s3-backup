@@ -1,0 +1,10 @@
+/dist/
+*.exe
+*.test
+.env
+.idea/
+/package/
+/release-files/
+*.dmg
+*.partial
+profiles.json

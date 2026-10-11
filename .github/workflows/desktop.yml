@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Validate release tag
+        id: version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_TYPE" != tag ]] || ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'Run this workflow on a version tag, for example v1.0.0.' >&2
+            exit 1
+          fi
+          printf 'tag=%s\nversion=%s\n' "$TAG" "${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: amd64
+            artifact: windows-amd64
+            tags: production
+          - os: ubuntu-22.04
+            arch: amd64
+            artifact: linux-amd64
+            tags: production,webkit2_41
+          - os: macos-15-intel
+            arch: amd64
+            artifact: macos-intel
+            tags: production
+          - os: macos-15
+            arch: arm64
+            artifact: macos-apple-silicon
+            tags: production
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev xdg-utils xvfb dbus-x11 unzip
+
+      - name: Linux AWS CLI v2
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if ! aws --version 2>&1 | grep -Fq 'aws-cli/2.'; then
+            curl --fail --silent --show-error --location https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$RUNNER_TEMP/aws.zip"
+            unzip -q "$RUNNER_TEMP/aws.zip" -d "$RUNNER_TEMP/aws-install"
+            "$RUNNER_TEMP/aws-install/aws/install" --install-dir "$RUNNER_TEMP/aws-cli" --bin-dir "$RUNNER_TEMP/aws-bin"
+            printf '%s\n' "$RUNNER_TEMP/aws-bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: macOS compiler and AWS CLI
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          xcrun --find clang
+          if ! aws --version 2>&1 | grep -Fq 'aws-cli/2.'; then brew install awscli; fi
+
+      - name: Enable local S3 integration tests
+        shell: bash
+        run: |
+          aws --version 2>&1 | grep -F 'aws-cli/2.'
+          aws_path="$(command -v aws)"
+          if [[ "$RUNNER_OS" == Windows ]]; then aws_path="$(cygpath -w "$aws_path")"; fi
+          printf 'S3_BACKUP_TEST_AWS=%s\n' "$aws_path" >> "$GITHUB_ENV"
+
+      - name: Tests and static checks
+        shell: bash
+        run: |
+          go test -tags '${{ matrix.tags }}' ./...
+          go vet -tags '${{ matrix.tags }}' ./...
+
+      - name: Native build
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: go run ./cmd/build -arch '${{ matrix.arch }}' -version "$RELEASE_VERSION"
+
+      - name: Linux GUI startup smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          xvfb-run -a dbus-run-session -- timeout 10s ./dist/linux-amd64/s3-backup > "$RUNNER_TEMP/s3-backup-gui.log" 2>&1
+          status=$?
+          cat "$RUNNER_TEMP/s3-backup-gui.log"
+          test "$status" -eq 124
+
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package -Force | Out-Null
+          Copy-Item -LiteralPath dist/s3-backup.exe -Destination package/s3-backup-windows-amd64.exe
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p package
+          tar -czf package/s3-backup-linux-amd64.tar.gz -C dist/linux-amd64 s3-backup
+
+      - name: Verify macOS DMG installation contents
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          image="dist/darwin-${{ matrix.arch }}/s3-backup-macos-${{ matrix.arch }}.dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$image"
+          trap 'hdiutil detach "$mount"; rmdir "$mount"' EXIT
+          test -d "$mount/S3 Backup.app"
+          test "$(readlink "$mount/Applications")" = /Applications
+          test -f "$mount/Установка.txt"
+          plutil -lint "$mount/S3 Backup.app/Contents/Info.plist"
+          codesign --verify --deep --strict "$mount/S3 Backup.app"
+          arch='${{ matrix.arch }}'
+          if [[ "$arch" == amd64 ]]; then arch=x86_64; fi
+          lipo -verify_arch "$arch" "$mount/S3 Backup.app/Contents/MacOS/s3-backup"
+
+      - name: Package macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p package
+          cp "dist/darwin-${{ matrix.arch }}/s3-backup-macos-${{ matrix.arch }}.dmg" package/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: package/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-files
+
+      - name: Verify all release files and checksums
+        working-directory: release-files
+        run: |
+          test -s s3-backup-windows-amd64.exe
+          test -s s3-backup-linux-amd64.tar.gz
+          test -s s3-backup-macos-amd64.dmg
+          test -s s3-backup-macos-arm64.dmg
+          sha256sum s3-backup-* > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "S3 Backup $RELEASE_TAG" --notes-file .github/release-notes.md "${flags[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" release-files/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --title "S3 Backup $RELEASE_TAG" --notes-file .github/release-notes.md "${flags[@]}"
