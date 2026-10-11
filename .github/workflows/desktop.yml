@@ -144,7 +144,7 @@ jobs:
           codesign --verify --deep --strict "$mount/S3 Backup.app"
           arch='${{ matrix.arch }}'
           if [[ "$arch" == amd64 ]]; then arch=x86_64; fi
-          lipo -verify_arch "$arch" "$mount/S3 Backup.app/Contents/MacOS/s3-backup"
+          lipo "$mount/S3 Backup.app/Contents/MacOS/s3-backup" -verify_arch "$arch"
 
       - name: Package macOS DMG
         if: runner.os == 'macOS'
